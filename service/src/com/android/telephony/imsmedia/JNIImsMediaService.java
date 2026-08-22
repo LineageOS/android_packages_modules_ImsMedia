@@ -104,6 +104,13 @@ public class JNIImsMediaService {
     public static native void setLogMode(int logMode, int debugLogMode);
 
     /**
+     * Sets the test mode for the ImsMediaService.
+     *
+     * @param testMode The test mode to be set.
+     */
+    public static native void setTestMode(int testMode);
+
+    /**
      * Gets intance of JNIImsMediaService for jni interface
      *
      * @return instance of JNIImsMediaService

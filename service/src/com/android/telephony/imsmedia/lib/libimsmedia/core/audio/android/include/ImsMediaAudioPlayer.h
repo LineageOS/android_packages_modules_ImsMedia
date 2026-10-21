@@ -153,11 +153,11 @@ public:
 
 private:
     void openAudioStream();
-    void restartAudioStream();
-    static void audioErrorCallback(AAudioStream* stream, void* userData, aaudio_result_t error);
+    bool restartAudioStream_l();
     bool decodeAmr(uint8_t* buffer, uint32_t size);
     bool decodeEvs(uint8_t* buffer, uint32_t size);
 
+    uint64_t mAudioStreamRestartTimeUs;
     AAudioStream* mAudioStream;
     AMediaCodec* mCodec;
     AMediaFormat* mFormat;

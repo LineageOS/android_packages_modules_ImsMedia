@@ -276,10 +276,18 @@ void ImsMediaAudioPlayer::Stop()
     IMLOGD0("[Stop] exit ");
 }
 
-bool ImsMediaAudioPlayer::onDataFrame(uint8_t* buffer, uint32_t size, FrameType /*frameType*/,
+bool ImsMediaAudioPlayer::onDataFrame(uint8_t* buffer, uint32_t size, FrameType frameType,
         bool /*hasNextFrame*/, uint8_t /*nextFrameByte*/)
 {
     ImsMediaMutex::Autolock lock(mMutex);
+
+    uint8_t noDataFrame = 0x7c;  // AMR NO_DATA (FT=15).
+    if ((mCodecType == kAudioCodecAmr || mCodecType == kAudioCodecAmrWb) &&
+            (frameType == NO_DATA || frameType == LOST) && buffer == nullptr && size == 0)
+    {
+        buffer = &noDataFrame;
+        size = sizeof(noDataFrame);
+    }
 
     if (size == 0 || buffer == nullptr || mAudioStream == nullptr ||
             AAudioStream_getState(mAudioStream) != AAUDIO_STREAM_STATE_STARTED)

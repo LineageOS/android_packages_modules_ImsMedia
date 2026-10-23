@@ -22,6 +22,7 @@
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 #include <ImsMediaMutex.h>
+#include <atomic>
 
 using android::sp;
 
@@ -156,6 +157,9 @@ private:
     bool closeAudioStream_l();
     bool stop_l();
     bool restartAudioStream_l();
+    bool queueFrames(const int16_t* data, uint32_t numFrames);
+    static aaudio_data_callback_result_t audioDataCallback(
+            AAudioStream* stream, void* userData, void* audioData, int32_t numFrames);
     bool decodeAmr(uint8_t* buffer, uint32_t size);
     bool decodeEvs(uint8_t* buffer, uint32_t size);
 
@@ -170,6 +174,15 @@ private:
     kEvsBandwidth mEvsBandwidth;
     uint16_t mBuffer[PCM_BUFFER_SIZE];
     ImsMediaMutex mMutex;
+    static constexpr uint32_t kFifoSize = 8192;
+    static_assert(std::atomic<uint32_t>::is_always_lock_free);
+    int16_t mFifo[kFifoSize];
+    std::atomic<uint32_t> mFifoReadIndex;
+    std::atomic<uint32_t> mFifoWriteIndex;
+    uint32_t mFifoTargetFrames;
+    uint32_t mFifoMaxFrames;
+    uint32_t mFifoPrerollFramesRemaining;
+    bool mFifoWaitingForData;
     int32_t mEvsBitRate;
     kRtpPayloadHeaderMode mEvsCodecHeaderMode;
     bool mIsFirstFrame;

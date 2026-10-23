@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <algorithm>
 
 #include <ImsMediaDefine.h>
 #include <ImsMediaTrace.h>
@@ -32,6 +33,8 @@
 #define AAUDIO_STATE_TIMEOUT_NANO (100 * 1000000L)
 #define DEFAULT_SAMPLING_RATE     (8000)
 #define CODEC_TIMEOUT_NANO        (100000)
+#define PLAYBACK_TARGET_DELAY_MS  (40)
+#define PLAYBACK_MAX_DELAY_MS     (80)
 
 using namespace android;
 
@@ -53,6 +56,12 @@ ImsMediaAudioPlayer::ImsMediaAudioPlayer()
     mIsOctetAligned = false;
     mIsDtxEnabled = false;
     mAudioStreamRestartTimeUs = 0;
+    mFifoReadIndex = 0;
+    mFifoWriteIndex = 0;
+    mFifoTargetFrames = 0;
+    mFifoMaxFrames = 0;
+    mFifoPrerollFramesRemaining = 0;
+    mFifoWaitingForData = true;
 }
 
 ImsMediaAudioPlayer::~ImsMediaAudioPlayer()
@@ -320,11 +329,79 @@ bool ImsMediaAudioPlayer::onDataFrame(uint8_t* buffer, uint32_t size, FrameType 
     }
     else if (mCodecType == kAudioCodecL16)
     {
+        if (size < MAX_PCM_SIZE * sizeof(int16_t))
+            return false;
         memcpy(mBuffer, buffer, (MAX_PCM_SIZE * 2));
-        // call audio write
-        AAudioStream_write(mAudioStream, mBuffer, MAX_PCM_SIZE, 0);
+        queueFrames(reinterpret_cast<int16_t*>(mBuffer), MAX_PCM_SIZE);
     }
     return false;
+}
+
+bool ImsMediaAudioPlayer::queueFrames(const int16_t* data, uint32_t numFrames)
+{
+    if (numFrames == 0)
+        return true;
+    if (data == nullptr)
+        return false;
+
+    const uint32_t writeIndex = mFifoWriteIndex.load(std::memory_order_relaxed);
+    const uint32_t queuedFrames = writeIndex - mFifoReadIndex.load(std::memory_order_acquire);
+    if (queuedFrames > kFifoSize || numFrames > kFifoSize - queuedFrames)
+    {
+        return false;
+    }
+
+    const uint32_t offset = writeIndex % kFifoSize;
+    const uint32_t first = std::min(numFrames, kFifoSize - offset);
+    memcpy(mFifo + offset, data, first * sizeof(int16_t));
+    memcpy(mFifo, reinterpret_cast<const uint8_t*>(data) + first * sizeof(int16_t),
+            (numFrames - first) * sizeof(int16_t));
+    mFifoWriteIndex.store(writeIndex + numFrames, std::memory_order_release);
+    return true;
+}
+
+aaudio_data_callback_result_t ImsMediaAudioPlayer::audioDataCallback(
+        AAudioStream* /*stream*/, void* userData, void* audioData, int32_t numFrames)
+{
+    auto* player = static_cast<ImsMediaAudioPlayer*>(userData);
+    auto* output = static_cast<int16_t*>(audioData);
+    if (numFrames <= 0)
+        return AAUDIO_CALLBACK_RESULT_CONTINUE;
+
+    memset(output, 0, numFrames * sizeof(int16_t));
+    uint32_t readIndex = player->mFifoReadIndex.load(std::memory_order_relaxed);
+    const uint32_t writeIndex = player->mFifoWriteIndex.load(std::memory_order_acquire);
+    uint32_t queuedFrames = writeIndex - readIndex;
+    if (queuedFrames > player->mFifoMaxFrames)
+    {
+        // Only the consumer discards old samples, after they are no longer in use.
+        readIndex = writeIndex - player->mFifoTargetFrames;
+        queuedFrames = player->mFifoTargetFrames;
+        player->mFifoPrerollFramesRemaining = 0;
+        player->mFifoWaitingForData = false;
+    }
+
+    if (player->mFifoWaitingForData && queuedFrames > 0)
+    {
+        player->mFifoPrerollFramesRemaining = player->mFifoTargetFrames;
+        player->mFifoWaitingForData = false;
+    }
+
+    // Count rendered silence so a short fragment never waits for more input.
+    const uint32_t silenceFrames = std::min<uint32_t>(
+            player->mFifoPrerollFramesRemaining, numFrames);
+    player->mFifoPrerollFramesRemaining -= silenceFrames;
+    const uint32_t framesToCopy = std::min<uint32_t>(queuedFrames, numFrames - silenceFrames);
+    for (uint32_t i = 0; i < framesToCopy; i++)
+    {
+        output[silenceFrames + i] = player->mFifo[(readIndex + i) % kFifoSize];
+    }
+    player->mFifoReadIndex.store(readIndex + framesToCopy, std::memory_order_release);
+    if (framesToCopy < static_cast<uint32_t>(numFrames) - silenceFrames)
+    {
+        player->mFifoWaitingForData = true;
+    }
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
 bool ImsMediaAudioPlayer::decodeAmr(uint8_t* buffer, uint32_t size)
@@ -367,11 +444,10 @@ bool ImsMediaAudioPlayer::decodeAmr(uint8_t* buffer, uint32_t size)
         {
             size_t buffCapacity;
             uint8_t* buf = AMediaCodec_getOutputBuffer(mCodec, index, &buffCapacity);
-            if (buf != nullptr && buffCapacity > 0)
+            if (buf != nullptr && info.size % sizeof(int16_t) == 0 &&
+                    static_cast<size_t>(info.size) <= buffCapacity)
             {
-                memcpy(mBuffer, buf, info.size);
-                // call audio write
-                AAudioStream_write(mAudioStream, mBuffer, info.size / 2, 0);
+                queueFrames(reinterpret_cast<const int16_t*>(buf), info.size / 2);
             }
         }
 
@@ -425,7 +501,7 @@ bool ImsMediaAudioPlayer::decodeEvs(uint8_t* buffer, uint32_t size)
         mIsFirstFrame = true;
     }
 
-    AAudioStream_write(mAudioStream, output, (decodeSize / 2), 0);
+    queueFrames(reinterpret_cast<int16_t*>(output), decodeSize / 2);
     memset(output, 0, PCM_BUFFER_SIZE);
 
     return true;
@@ -452,6 +528,7 @@ bool ImsMediaAudioPlayer::openAudioStream()
     AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_EXCLUSIVE);
     AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_VOICE_COMMUNICATION);
+    AAudioStreamBuilder_setDataCallback(builder, audioDataCallback, this);
 
     // open stream
     result = AAudioStreamBuilder_openStream(builder, &mAudioStream);
@@ -464,6 +541,26 @@ bool ImsMediaAudioPlayer::openAudioStream()
         closeAudioStream_l();
         return false;
     }
+    const int32_t sampleRate = AAudioStream_getSampleRate(mAudioStream);
+    if (sampleRate <= 0 || AAudioStream_getChannelCount(mAudioStream) != 1 ||
+            AAudioStream_getFormat(mAudioStream) != AAUDIO_FORMAT_PCM_I16)
+    {
+        IMLOGE0("[openAudioStream] Invalid PCM configuration");
+        closeAudioStream_l();
+        return false;
+    }
+
+    mFifoMaxFrames = std::clamp<uint64_t>(
+            static_cast<uint64_t>(sampleRate) * PLAYBACK_MAX_DELAY_MS / 1000, 2, kFifoSize / 2);
+    mFifoTargetFrames = std::clamp<uint64_t>(
+            static_cast<uint64_t>(sampleRate) * PLAYBACK_TARGET_DELAY_MS / 1000, 1,
+            mFifoMaxFrames / 2);
+    mFifoReadIndex = 0;
+    mFifoWriteIndex = 0;
+    mFifoPrerollFramesRemaining = 0;
+    mFifoWaitingForData = true;
+    IMLOGI3("[openAudioStream] PCM queue rate[%d] target[%u] maximum[%u]", sampleRate,
+            mFifoTargetFrames, mFifoMaxFrames);
     return true;
 }
 

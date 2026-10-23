@@ -152,7 +152,9 @@ public:
             uint8_t nextFrameByte);
 
 private:
-    void openAudioStream();
+    bool openAudioStream();
+    bool closeAudioStream_l();
+    bool stop_l();
     bool restartAudioStream_l();
     bool decodeAmr(uint8_t* buffer, uint32_t size);
     bool decodeEvs(uint8_t* buffer, uint32_t size);

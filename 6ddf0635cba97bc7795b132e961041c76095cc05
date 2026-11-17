@@ -16,6 +16,23 @@
       "message": "vince, re-add me when/if ready.",
       "revId": "6ddf0635cba97bc7795b132e961041c76095cc05",
       "serverId": "1ec6b3db-b2c1-4fa4-84a2-4c7efe89ba71"
+    },
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "7bd18366_deb56ff3",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 34207
+      },
+      "writtenOn": "2026-11-17T15:09:07Z",
+      "side": 1,
+      "message": "All commits in this chain need explanations of the exact issues they fix in their message (e.g. crackling audio).",
+      "revId": "6ddf0635cba97bc7795b132e961041c76095cc05",
+      "serverId": "1ec6b3db-b2c1-4fa4-84a2-4c7efe89ba71"
     }
   ]
 }

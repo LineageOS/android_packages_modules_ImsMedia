@@ -405,19 +405,23 @@ bool AudioJitterBuffer::Get(ImsMediaSubType* psubtype, uint8_t** ppData, uint32_
         Resync(MAX_QUEUE_SIZE);
     }
 
-    // adjust the playing timestamp
-    if (mDataQueue.Get(&pEntry) && pEntry->nTimestamp != mCurrPlayingTS &&
-            ((mCurrPlayingTS - ALLOWABLE_ERROR) <= pEntry->nTimestamp) &&
-            (pEntry->nTimestamp <= (mCurrPlayingTS + ALLOWABLE_ERROR)))
+    // Check each new head against the same playout tolerance after dropping a late frame.
+    while (mDataQueue.Get(&pEntry))
     {
-        IMLOGD3("[Get] sync playing curTS=%u, TS=%u, seq=%d", mCurrPlayingTS, pEntry->nTimestamp,
-                pEntry->nSeqNum);
-        mCurrPlayingTS = pEntry->nTimestamp;
-    }
+        if (pEntry->nTimestamp != mCurrPlayingTS &&
+                ((mCurrPlayingTS - ALLOWABLE_ERROR) <= pEntry->nTimestamp) &&
+                (pEntry->nTimestamp <= (mCurrPlayingTS + ALLOWABLE_ERROR)))
+        {
+            IMLOGD3("[Get] sync playing curTS=%u, TS=%u, seq=%d", mCurrPlayingTS, pEntry->nTimestamp,
+                    pEntry->nSeqNum);
+            mCurrPlayingTS = pEntry->nTimestamp;
+        }
 
-    // delete late arrival
-    while (mDataQueue.Get(&pEntry) && !USHORT_TS_ROUND_COMPARE(pEntry->nTimestamp, mCurrPlayingTS))
-    {
+        if (USHORT_TS_ROUND_COMPARE(pEntry->nTimestamp, mCurrPlayingTS))
+        {
+            break;
+        }
+
         mDtxPlayed = (pEntry->eDataType == MEDIASUBTYPE_AUDIO_SID);
 
         // discard case that latest packet is about to cut by the jitter then update the

@@ -153,6 +153,8 @@ public:
 
 private:
     void openAudioStream();
+    bool startAudioStream(int64_t timeoutNanos);
+    void closeAudioStream();
     void restartAudioStream();
     static void audioErrorCallback(AAudioStream* stream, void* userData, aaudio_result_t error);
     bool decodeAmr(uint8_t* buffer, uint32_t size);

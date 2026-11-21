@@ -89,11 +89,15 @@ ImsMediaResult IAudioPlayerNode::Start()
         }
         mAudioPlayer->SetCodecMode(mode);
 
-        mAudioPlayer->Start();
+        if (!mAudioPlayer->Start())
+        {
+            return RESULT_NOT_READY;
+        }
     }
     else
     {
         IMLOGE0("[IAudioPlayer] Not able to start AudioPlayer");
+        return RESULT_NOT_READY;
     }
 
     mNodeState = kNodeStateRunning;

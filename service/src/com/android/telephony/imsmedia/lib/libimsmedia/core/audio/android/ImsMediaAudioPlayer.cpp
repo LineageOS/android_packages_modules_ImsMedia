@@ -21,7 +21,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <memory>
 #include <thread>
+#include <vector>
 
 #include <ImsMediaDefine.h>
 #include <ImsMediaTrace.h>
@@ -35,6 +37,41 @@
 #define CODEC_TIMEOUT_NANO        (100000)
 
 using namespace android;
+
+namespace
+{
+aaudio_result_t waitForStreamStart(AAudioStream* stream, int64_t timeoutNanos)
+{
+    aaudio_stream_state_t state = AAUDIO_STREAM_STATE_UNINITIALIZED;
+    const auto result = AAudioStream_waitForStateChange(
+            stream, AAUDIO_STREAM_STATE_STARTING, &state, timeoutNanos);
+    if (result != AAUDIO_OK)
+    {
+        return result;
+    }
+    if (state == AAUDIO_STREAM_STATE_DISCONNECTED)
+    {
+        return AAUDIO_ERROR_DISCONNECTED;
+    }
+    return state == AAUDIO_STREAM_STATE_STARTED ? AAUDIO_OK : AAUDIO_ERROR_INVALID_STATE;
+}
+
+aaudio_result_t primeLegacyStream(AAudioStream* stream)
+{
+    // AudioTrack may require a full buffer before its playback position advances.
+    // One burst is not necessarily enough to reach this start threshold.
+    const int32_t frames = AAudioStream_getBufferSizeInFrames(stream);
+    const int32_t channels = AAudioStream_getChannelCount(stream);
+    if (frames <= 0 || channels <= 0)
+    {
+        return AAUDIO_ERROR_INVALID_STATE;
+    }
+    const std::vector<int16_t> silence(static_cast<size_t>(frames) * channels, 0);
+    // The legacy path treats any positive timeout as a blocking AudioTrack write.
+    const auto written = AAudioStream_write(stream, silence.data(), frames, 0);
+    return written < 0 ? written : AAUDIO_OK;
+}
+}  // namespace
 
 ImsMediaAudioPlayer::ImsMediaAudioPlayer()
 {
@@ -116,6 +153,7 @@ void ImsMediaAudioPlayer::ProcessCmr(const uint32_t cmr)
 
 bool ImsMediaAudioPlayer::Start()
 {
+    ImsMediaMutex::Autolock lock(mMutex);
     char kMimeType[128] = {'\0'};
     switch (mCodecType)
     {
@@ -146,84 +184,56 @@ bool ImsMediaAudioPlayer::Start()
 
     IMLOGD1("[Start] Creating codec[%s]", kMimeType);
 
+    std::unique_ptr<AMediaFormat, decltype(&AMediaFormat_delete)> format(
+            nullptr, AMediaFormat_delete);
+    std::unique_ptr<AMediaCodec, decltype(&AMediaCodec_delete)> codec(nullptr, AMediaCodec_delete);
     if (mCodecType == kAudioCodecAmr || mCodecType == kAudioCodecAmrWb)
     {
-        mFormat = AMediaFormat_new();
-        AMediaFormat_setString(mFormat, AMEDIAFORMAT_KEY_MIME, kMimeType);
-        AMediaFormat_setInt32(mFormat, AMEDIAFORMAT_KEY_SAMPLE_RATE, mSamplingRate);
-        AMediaFormat_setInt32(mFormat, AMEDIAFORMAT_KEY_CHANNEL_COUNT, 1);
+        format.reset(AMediaFormat_new());
+        if (format == nullptr)
+        {
+            IMLOGE0("[Start] unable to create codec format");
+            closeAudioStream();
+            return false;
+        }
+        AMediaFormat_setString(format.get(), AMEDIAFORMAT_KEY_MIME, kMimeType);
+        AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_SAMPLE_RATE, mSamplingRate);
+        AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_CHANNEL_COUNT, 1);
 
-        mCodec = AMediaCodec_createDecoderByType(kMimeType);
-
-        if (mCodec == nullptr)
+        codec.reset(AMediaCodec_createDecoderByType(kMimeType));
+        if (codec == nullptr)
         {
             IMLOGE1("[Start] unable to create %s codec instance", kMimeType);
-            AMediaFormat_delete(mFormat);
-            mFormat = nullptr;
+            closeAudioStream();
             return false;
         }
 
         IMLOGD0("[Start] configure codec");
-        media_status_t codecResult = AMediaCodec_configure(mCodec, mFormat, nullptr, nullptr, 0);
-
-        if (codecResult != AMEDIA_OK)
+        const auto result = AMediaCodec_configure(codec.get(), format.get(), nullptr, nullptr, 0);
+        if (result != AMEDIA_OK)
         {
-            IMLOGE2("[Start] unable to configure[%s] codec - err[%d]", kMimeType, codecResult);
-            AMediaCodec_delete(mCodec);
-            mCodec = nullptr;
-            AMediaFormat_delete(mFormat);
-            mFormat = nullptr;
+            IMLOGE2("[Start] unable to configure[%s] codec - err[%d]", kMimeType, result);
+            closeAudioStream();
             return false;
         }
     }
 
-    aaudio_stream_state_t inputState = AAUDIO_STREAM_STATE_STARTING;
-    aaudio_stream_state_t nextState = AAUDIO_STREAM_STATE_UNINITIALIZED;
-    auto result = AAudioStream_requestStart(mAudioStream);
-
-    if (result != AAUDIO_OK)
+    if (!startAudioStream(AAUDIO_STATE_TIMEOUT_NANO))
     {
-        IMLOGE1("[Start] Error start stream[%s]", AAudio_convertResultToText(result));
-        if (mCodecType == kAudioCodecAmr || mCodecType == kAudioCodecAmrWb)
-        {
-            AMediaCodec_delete(mCodec);
-            mCodec = nullptr;
-            AMediaFormat_delete(mFormat);
-            mFormat = nullptr;
-        }
         return false;
     }
 
-    result = AAudioStream_waitForStateChange(
-            mAudioStream, inputState, &nextState, AAUDIO_STATE_TIMEOUT_NANO);
-
-    if (result != AAUDIO_OK)
+    if (codec != nullptr)
     {
-        IMLOGE1("[Start] Error start stream[%s]", AAudio_convertResultToText(result));
-        if (mCodecType == kAudioCodecAmr || mCodecType == kAudioCodecAmrWb)
+        const auto result = AMediaCodec_start(codec.get());
+        if (result != AMEDIA_OK)
         {
-            AMediaCodec_delete(mCodec);
-            mCodec = nullptr;
-            AMediaFormat_delete(mFormat);
-            mFormat = nullptr;
-        }
-        return false;
-    }
-
-    IMLOGI1("[Start] start stream state[%s]", AAudio_convertStreamStateToText(nextState));
-
-    if (mCodecType == kAudioCodecAmr || mCodecType == kAudioCodecAmrWb)
-    {
-        media_status_t codecResult = AMediaCodec_start(mCodec);
-        if (codecResult != AMEDIA_OK)
-        {
-            IMLOGE1("[Start] unable to start codec - err[%d]", codecResult);
-            AMediaCodec_delete(mCodec);
-            mCodec = nullptr;
-            AMediaFormat_delete(mFormat);
-            mFormat = nullptr;
+            IMLOGE1("[Start] unable to start codec - err[%d]", result);
+            closeAudioStream();
             return false;
         }
+        mCodec = codec.release();
+        mFormat = format.release();
     }
 
     IMLOGD0("[Start] exit");
@@ -269,8 +279,7 @@ void ImsMediaAudioPlayer::Stop()
 
         IMLOGI1("[Stop] stream state[%s]", AAudio_convertStreamStateToText(nextState));
 
-        AAudioStream_close(mAudioStream);
-        mAudioStream = nullptr;
+        closeAudioStream();
     }
 
     IMLOGD0("[Stop] exit ");
@@ -455,6 +464,51 @@ void ImsMediaAudioPlayer::openAudioStream()
     }
 }
 
+bool ImsMediaAudioPlayer::startAudioStream(int64_t timeoutNanos)
+{
+    for (int attempt = 0; mAudioStream != nullptr; ++attempt)
+    {
+        const bool isLegacy = !AAudioStream_isMMapUsed(mAudioStream);
+        auto result = AAudioStream_requestStart(mAudioStream);
+        if (result == AAUDIO_OK)
+        {
+            // Preserve the normal start path. On a fresh legacy retry, probe state
+            // without waiting again before providing the PCM needed to make progress.
+            result = waitForStreamStart(mAudioStream, attempt == 0 || !isLegacy ? timeoutNanos : 0);
+            if (result == AAUDIO_ERROR_TIMEOUT && isLegacy)
+            {
+                IMLOGD0("[startAudioStream] priming legacy output");
+                result = primeLegacyStream(mAudioStream);
+                if (result == AAUDIO_OK)
+                {
+                    result = waitForStreamStart(mAudioStream, AAUDIO_STATE_TIMEOUT_NANO);
+                }
+            }
+        }
+        if (result == AAUDIO_OK)
+        {
+            IMLOGI0("[startAudioStream] stream started");
+            return true;
+        }
+
+        IMLOGE1("[startAudioStream] Error starting stream[%s]", AAudio_convertResultToText(result));
+        closeAudioStream();
+        if (attempt != 0 || !isLegacy || result != AAUDIO_ERROR_TIMEOUT)
+        {
+            break;
+        }
+        // Retry a stalled legacy start once on a fresh track, retaining the codec.
+        openAudioStream();
+    }
+    return false;
+}
+
+void ImsMediaAudioPlayer::closeAudioStream()
+{
+    AAudioStream_close(mAudioStream);
+    mAudioStream = nullptr;
+}
+
 void ImsMediaAudioPlayer::restartAudioStream()
 {
     ImsMediaMutex::Autolock lock(mMutex);
@@ -465,36 +519,9 @@ void ImsMediaAudioPlayer::restartAudioStream()
     }
 
     AAudioStream_requestStop(mAudioStream);
-    AAudioStream_close(mAudioStream);
-
-    mAudioStream = nullptr;
+    closeAudioStream();
     openAudioStream();
-
-    if (mAudioStream == nullptr)
-    {
-        return;
-    }
-
-    aaudio_stream_state_t inputState = AAUDIO_STREAM_STATE_STARTING;
-    aaudio_stream_state_t nextState = AAUDIO_STREAM_STATE_UNINITIALIZED;
-    aaudio_result_t result = AAudioStream_requestStart(mAudioStream);
-    if (result != AAUDIO_OK)
-    {
-        IMLOGE1("[restartAudioStream] Error start stream[%s]", AAudio_convertResultToText(result));
-        return;
-    }
-
-    result = AAudioStream_waitForStateChange(
-            mAudioStream, inputState, &nextState, 3 * AAUDIO_STATE_TIMEOUT_NANO);
-
-    if (result != AAUDIO_OK)
-    {
-        IMLOGE1("[restartAudioStream] Error start stream[%s]", AAudio_convertResultToText(result));
-        return;
-    }
-
-    IMLOGI1("[restartAudioStream] start stream state[%s]",
-            AAudio_convertStreamStateToText(nextState));
+    startAudioStream(3 * AAUDIO_STATE_TIMEOUT_NANO);
 }
 
 void ImsMediaAudioPlayer::audioErrorCallback(

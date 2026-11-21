@@ -1,0 +1,21 @@
+{
+  "comments": [
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "30b30b18_f34caea4",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 38440
+      },
+      "writtenOn": "2026-11-21T18:47:54Z",
+      "side": 1,
+      "message": "Context: on the M20 (legacy AAudio, no MMAP) the player\u0027s first start times out (AAUDIO_ERROR_TIMEOUT, state STARTING) and incoming VoLTE calls have no downlink audio. I first tried the open series 513084–513087 + 514335 (applied cleanly, built for arm64/arm): the first start still timed out ([Start] Unable to start stream: result[-885], state[3]), no audio. With this change the stream starts and the downlink is audible; verified twice on the same device with the same call. Happy to rebase on top of that series if you prefer",
+      "revId": "f73f94af77fbacc0ab6658f5d6b125e1007f1a1f",
+      "serverId": "1ec6b3db-b2c1-4fa4-84a2-4c7efe89ba71"
+    }
+  ]
+}
